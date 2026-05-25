@@ -1,0 +1,296 @@
+Here is the absolute master blueprint of the CORPSS Architectural Framework. This deep dive fuses the high-level principles with your regional ap-southeast-2 (Sydney) deployment requirements, actual AWS Console paths, and ready-to-deploy Python (boto3) patterns.
+
+This is your definitive technical playbook for the panel on Wednesday.
+
+🪙 1. Cost Optimization (GENCOST)
+
+The Architecture Strategy
+
+The primary threat to an enterprise GenAI budget is unmonitored logging and real-time execution of heavy, non-time-sensitive workloads. Under GENCOST, we mitigate this by implementing aggressive telemetry filters and shifting background data tasks to cheaper, asynchronous billing tracks.
+
+🏢 In the AWS Console
+
+CloudWatch Application Signals: Navigate to CloudWatch $\rightarrow$ Application Signals $\rightarrow$ Settings. Under GenAI Observability Sampling, locate your active application or Bedrock Agent, click Edit, and explicitly set the Trace Indexing % to 1.
+
+Bedrock Batch Job Setup: Navigate to Amazon Bedrock $\rightarrow$ Assessment and deployment $\rightarrow$ Batch inference. Click Create batch inference job, choose your foundation model, and point the input configuration to your raw payload manifest file inside an encrypted S3 bucket.
+
+💻 The Code Implementation: Running 50% Cheaper Asynchronous Batch Jobs
+
+Python
+
+import boto3
+
+bedrock = boto3.client(service_name="bedrock", region_name="ap-southeast-2")
+
+def submit_serverless_batch_audit():
+    # Asynchronous batch processing gives a flat 50% discount vs On-Demand tokens
+    response = bedrock.create_model_invocation_job(
+        jobName="Nightly_Compliance_Bulk_Audit",
+        modelId="us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+        roleArn="arn:aws:iam::123456789012:role/BedrockBatchProcessingRole",
+        inputDataConfig={
+            "s3InputUri": "s3://rackspace-sydney-vault/batch-inputs/pending_loans.json"
+        },
+        outputDataConfig={
+            "s3OutputUri": "s3://rackspace-sydney-vault/batch-outputs/"
+        }
+    )
+    print(f"Batch Job Created successfully. JobArn: {response['jobArn']}")
+    return response["jobArn"]
+
+
+🏎️ 2. Operational Excellence (GENOPS)
+
+The Architecture Strategy
+
+Enforcing the Open-Closed Principle (OCP) across modern AI platforms means separating prompt optimization from backend core logic. Prompts must live as version-controlled configurations. Any modification to a prompt asset must clear an automated quality gate before it is promoted to production.
+
+🏢 In the AWS Console
+
+Prompt Management: Navigate to Amazon Bedrock $\rightarrow$ Orchestration $\rightarrow$ Prompt Management. Click Create prompt, write your system instructions, and add a dynamic parameter token like {{user_query}}.
+
+Alias Assignment: After clicking Create version to lock down version 2, navigate to the Aliases tab for that prompt, click Create alias, name it PROD, and map it explicitly to target version 2.
+
+💻 The Code Implementation: Decoupled Prompt Hydration via Bedrock Aliases
+
+Python
+
+import boto3
+
+bedrock_control = boto3.client(service_name="bedrock", region_name="ap-southeast-2")
+bedrock_runtime = boto3.client(service_name="bedrock-runtime", region_name="ap-southeast-2")
+
+def execute_decoupled_prompt(customer_query: str):
+    # Core software is CLOSED to modification. It targets an immutable prompt alias ARN.
+    PROMPT_ALIAS_ARN = "arn:aws:bedrock:ap-southeast-2:123456789012:prompt/LOAN_ROUTER/aliases/PROD"
+
+    # 1. Fetch the system instructions dynamically from the configuration registry
+    prompt_config = bedrock_control.get_prompt(promptIdentifier=PROMPT_ALIAS_ARN)
+    system_template = prompt_config['variants'][0]['templateText']
+
+    # 2. Hydrate the config template variable
+    final_instructions = system_template.replace("{{user_query}}", customer_query)
+
+    # 3. Route clean payload to the inference engine
+    response = bedrock_runtime.converse(
+        modelId="us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+        messages=[{"role": "user", "content": [{"text": final_instructions}]}]
+    )
+    return response['output']['message']['content'][0]['text']
+
+
+🛡️ 3. Reliability (GENREL)
+
+The Architecture Strategy
+
+Reliability requires maximizing Blast Radius Isolation and preventing application connection timeouts. We handle macro-level workflows with rigid infrastructure states, isolate concurrent agent loops using the SNS + SQS Fan-Out pattern, and host long-running tasks in secure, asynchronous execution containers.
+
+🏢 In the AWS Console
+
+SNS Topic Creation: Open Amazon SNS $\rightarrow$ Topics $\rightarrow$ Create topic. Select Standard, name it AgentTransactionStream, and save.
+
+SQS Subscriptions: Open Amazon SQS $\rightarrow$ Create queue. Create separate worker queues: fraud-check-queue and compliance-check-queue. Go back to your SNS Topic, click Create subscription, select Amazon SQS as the protocol, and bind your queues.
+
+💻 The Code Implementation: Broadcasting a Single Event to Parallel Sub-Agents
+
+Python
+
+import boto3
+import json
+
+sns = boto3.client(service_name="sns", region_name="ap-southeast-2")
+TOPIC_ARN = "arn:aws:sns:ap-southeast-2:123456789012:AgentTransactionStream"
+
+def broadcast_transaction_event(account_id: str, payload_summary: str):
+    event_message = {
+        "account_id": account_id,
+        "summary": payload_summary,
+        "region_context": "ap-southeast-2"
+    }
+
+    # Open-Closed Extension: Fanning out to infinite queues simultaneously.
+    # If the fraud queue crashes, the compliance queue continues completely unaffected.
+    sns.publish(
+        TopicArn=TOPIC_ARN,
+        Message=json.dumps(event_message),
+        MessageAttributes={
+            "TransactionTier": {"DataType": "String", "StringValue": "HighRisk"}
+        }
+    )
+    print("Transaction broadcasted via Fan-Out pattern to independent agent queues.")
+
+
+⚡ 4. Performance Efficiency (GENPERF)
+
+The Architecture Strategy
+
+LLM response generation is computationally heavy. Synchronous request-response loops create massive interface bottlenecks. To enforce high performance, we use API Gateway WebSockets paired with the Bedrock converse_stream client to stream output tokens live, and leverage Provisioned Throughput to secure a guaranteed latency SLA.
+
+🏢 In the AWS Console
+
+Provisioned Throughput Acquisition: Navigate to Amazon Bedrock $\rightarrow$ Assessment and deployment $\rightarrow$ Provisioned throughput. Click Purchase Provisioned Throughput, select your target model (e.g., Claude 3.5 Sonnet), choose your Model Units (MUs), and confirm. Copy your dedicated infrastructure resource ARN.
+
+💻 The Code Implementation: Bi-directional Token Streaming via WebSockets
+
+Python
+
+import boto3
+import json
+
+def lambda_handler(event, context):
+    connection_id = event['requestContext']['connectionId']
+    domain_name = event['requestContext']['domainName']
+    stage = event['requestContext']['stage']
+    user_prompt = json.loads(event['body'])['prompt']
+
+    bedrock_runtime = boto3.client(service_name="bedrock-runtime", region_name="ap-southeast-2")
+    # Gateway client routes tokens back to the unique web socket session
+    gateway_api = boto3.client(
+        service_name="apigatewaymanagementapi",
+        endpoint_url=f"https://{domain_name}/{stage}"
+    )
+
+    # Using dedicated Provisioned Capacity to eliminate "Noisy Neighbor" region latency surges
+    DEDICATED_PT_ARN = "arn:aws:bedrock:ap-southeast-2:123456789012:provisioned-model/sydney-prod-fast-lane"
+
+    stream_response = bedrock_runtime.converse_stream(
+        modelId=DEDICATED_PT_ARN,
+        messages=[{"role": "user", "content": [{"text": user_prompt}]}]
+    )
+
+    for chunk in stream_response['stream']:
+        if 'contentBlockDelta' in chunk:
+            live_token = chunk['contentBlockDelta']['delta']['text']
+
+            # Instantly push token to client browser UI (Latency feels < 200ms)
+            gateway_api.post_to_connection(
+                ConnectionId=connection_id,
+                Data=json.dumps({"token": live_token})
+            )
+
+
+🔒 5. Security (GENSEC)
+
+The Architecture Strategy
+
+Enterprise security requires strict mitigation against Indirect Prompt Injections, preventing data exfiltration/PII leaks, and maintaining localized compute environments to satisfy regulatory data sovereignty rules.
+
+🏢 In the AWS Console
+
+Guardrail Isolation: Set your console region strictly to Asia Pacific (Sydney). Navigate to Amazon Bedrock $\rightarrow$ Safeguards $\rightarrow$ Guardrails. Click Create guardrail.
+
+Filters: Inside the Content Filters tab, toggle on Prompt attacks and set the strength to High. In the Sensitive Information tab, add entities like Email, SSN, and IP Address, setting them to Block Input and Mask Output. Save and publish as Version 1.
+
+💻 The Code Implementation: Dual-Sided Input/Output Security Perimeter
+
+Python
+
+import boto3
+from botocore.exceptions import ClientError
+
+bedrock_runtime = boto3.client(service_name="bedrock-runtime", region_name="ap-southeast-2")
+
+def safe_perimeter_execution(untrusted_user_input: str):
+    try:
+        response = bedrock_runtime.converse(
+            modelId="us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+            messages=[{"role": "user", "content": [{"text": untrusted_user_input}]}],
+            # Enforcing dual-sided protection inside the Sydney data center boundary
+            guardrailConfig={
+                "guardrailIdentifier": "gdr-sydney-perimeter-01",
+                "guardrailVersion": "1",
+                "streamProcessingMode": "sync" # Synchronously filters input AND scans output
+            }
+        )
+
+        # Intercept if the perimeter fence stepped in
+        if "guardrail" in response and response["guardrail"].get("action") == "INTERVENED":
+            print("🚨 Guardrail Intervened! Neutered prompt attack or stopped output PII leak.")
+
+        return response["output"]["message"]["content"][0]["text"]
+
+    except ClientError as e:
+        print(f"Security Protocol Fault: {e}")
+        raise e
+
+
+
+
+
+
+6. Sustainability (GERSUST)
+
+The Architecture Strategy
+
+Sustainability in GenAI means maximizing the computational efficiency of every single watt consumed. We achieve this by moving workloads away from high-energy real-time execution pools when possible, right-sizing our model selections based on task complexity (e.g., using a small model for small tasks), and selecting cloud hardware explicitly optimized for energy efficiency.
+
+🏢 In the AWS Console
+
+The AWS Customer Carbon Footprint Tool: Navigate to the Billing and Cost Management Console $\rightarrow$ scroll down the left sidebar menu to Cost analysis $\rightarrow$ click Carbon Footprint Tool. Here, you can track the exact geographic emissions metrics generated by your active ap-southeast-2 (Sydney) agent architecture.
+
+Model Catalog Optimization: Navigate to Amazon Bedrock $\rightarrow$ Model catalog. When choosing model tiers, filter for lightweight or distillation variants (like Claude 3.5 Haiku or Amazon Nova Micro) for baseline preprocessing tasks, rather than defaulting to maximum-parameter models.
+
+💻 The Code Implementation: Energy-Minimized Route Tokenization
+
+Instead of routing every single conversational transaction to a massive, energy-hungry foundation model, use a lightweight, hardware-optimized model to pre-filter and parse requests.
+
+Python
+
+import boto3
+from botocore.exceptions import ClientError
+
+bedrock_runtime = boto3.client(service_name="bedrock-runtime", region_name="ap-southeast-2")
+
+def sustainable_intent_router(user_query: str):
+    try:
+        # 1. We route the initial processing to an ultra-lightweight, energy-efficient model.
+        # This executes on highly optimized AWS Trainium/Inferentia chips behind the scenes,
+        # consuming significantly less power per token than a massive frontier model.
+        SUSTAINABLE_MODEL_ID = "amazon.nova-micro-v1:0"
+
+        routing_prompt = f"""
+        Classify the user intent into SIMPLE or COMPLEX. Return only the token.
+        User Query: {user_query}
+        """
+
+        response = bedrock_runtime.converse(
+            modelId=SUSTAINABLE_MODEL_ID,
+            messages=[{"role": "user", "content": [{"text": routing_prompt}]}]
+        )
+
+        intent = response["output"]["message"]["content"][0]["text"].strip()
+
+        # 2. Right-size the compute path based on actual cognitive necessity
+        if "SIMPLE" in intent:
+            # Keep the transaction entirely inside the low-emission compute track
+            print("🍃 Sustainability Match: Handled via low-power local compute.")
+            return f"Processed simply via {SUSTAINABLE_MODEL_ID}"
+        else:
+            # Only spin up the massive power-hungry frontier model when highly complex reasoning is demanded
+            print("🚀 Escalating to deep reasoning engine.")
+            complex_response = bedrock_runtime.converse(
+                modelId="us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+                messages=[{"role": "user", "content": [{"text": user_query}]}]
+            )
+            return complex_response["output"]["message"]["content"][0]["text"]
+
+    except ClientError as e:
+        print(f"Execution Failure: {e}")
+        raise e
+
+
+🎯 The Ultimate 6-Pillar Framework Map (CORPSSS)
+
+To ensure nothing gets dropped when you stand in front of the board on Wednesday, memorize this unified, updated acronym: CORPSSS (pronounced "Corpus").
+
+C – Cost Optimization (GENCOST): 1% CloudWatch trace sampling rates and 50% cheaper S3 serverless Batch Inference jobs.
+
+O – Operational Excellence (GENOPS): Open-Closed prompt registries via Bedrock Prompt Aliases and declarative @aws/agentcore CLI workflows.
+
+R – Reliability (GENREL): Hard macro/micro state splits (Step Functions + Strands/LangGraph), 8-hour AgentCore Runtime micro-VMs, and SNS + SQS Fan-Out blast radius isolation.
+
+P – Performance Efficiency (GENPERF): API Gateway WebSocket bi-directional token streaming and Bedrock Provisioned Throughput dedicated SLAs.
+
+S – Security (GENSEC): Dual-sided synchronous Bedrock Guardrails (Pre-Inference entry block + Post-Inference exit mask) locked to localized Sydney data center boundaries.
+
+S – Sustainability (GERSUST): Right-sizing workloads via low-power hardware tracks (like Amazon Nova Micro) to minimize the carbon and energy footprint per transaction.

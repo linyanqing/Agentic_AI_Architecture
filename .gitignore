@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Demo runtime artefacts (contains live AWS ARNs)
+corpss_app/demo_env.json
+
+# IDE
+.DS_Store
