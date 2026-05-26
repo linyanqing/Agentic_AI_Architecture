@@ -21,14 +21,25 @@
 
 ---
 
+## Architecture Diagrams
+
+| Diagram | Description |
+|---------|-------------|
+| 📐 [`Bedrock_AgentCore_ReferenceArchitecture.md`](architecture/Bedrock_AgentCore_ReferenceArchitecture.md) | **Full reference architecture** — all 7 layers from Client → API Gateway → Step Functions → AgentCore Runtime → Bedrock → SNS/SQS → Observability, with component descriptions and CORPSS pillar mapping |
+| 🔀 [`LanggraphGraphDiagram.md`](architecture/LanggraphGraphDiagram.md) | LangGraph state-machine — micro-orchestration flow (Router → Simple/Primary/Fallback nodes) |
+| 🪜 [`AWS_Step_StateDiagram.md`](architecture/AWS_Step_StateDiagram.md) | AWS Step Functions state diagram — macro workflow (Choice states, Catch blocks, Succeed terminal) |
+
+---
+
 ## Repository Structure
 
 ```
 AWS_AI/
 ├── architecture/
-│   ├── AI_CORPSS_Lens.txt          ← Master CORPSS framework blueprint
-│   ├── LanggraphGraphDiagram.md    ← LangGraph state-machine diagram
-│   └── AWS_Step_StateDiagram.md    ← AWS Step Functions state diagram
+│   ├── Bedrock_AgentCore_ReferenceArchitecture.md  ← Full reference architecture + component guide
+│   ├── AI_CORPSS_Lens.txt                          ← Master CORPSS framework blueprint
+│   ├── LanggraphGraphDiagram.md                    ← LangGraph state-machine diagram
+│   └── AWS_Step_StateDiagram.md                    ← AWS Step Functions state diagram
 │
 └── corpss_app/                     ← Production Python application
     ├── README.md                   ← App-level docs & AWS Console checklist
