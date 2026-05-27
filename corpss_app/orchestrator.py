@@ -23,6 +23,9 @@ Ties all 7 CORPSEE pillars into a single, coherent request pipeline.
                     │       ↓                                          │
      Response  ◄──  │  Final payload                                   │
                     │                                                  │
+     Multi-Agent ►  │  [R·GENREL]   Supervisor → parallel sub-agents  │
+     Pipeline       │  [E·GENEVAL]  Continuous eval loop + drift gate │
+                    │                                                  │
      Batch Mode ──► │  [C·GENCOST]  Async batch + prompt caching      │
      Eval Mode  ──► │  [E·GENEVAL]  Offline evaluation job            │
                     └─────────────────────────────────────────────────┘
@@ -30,22 +33,25 @@ Ties all 7 CORPSEE pillars into a single, coherent request pipeline.
 Pillar map (CORPSEE):
   C – GENCOST  · Cost Optimisation     (batch, prompt caching, 1% trace)
   O – GENOPS   · Operational Excel.    (version-locked prompt aliases, OTEL)
-  R – GENREL   · Reliability           (fan-out, circuit breaker failover)
+  R – GENREL   · Reliability           (fan-out, circuit breaker, multi-agent coord)
   P – GENPERF  · Performance           (AgentCore Harness, WebSocket stream)
   S – GENSEC   · Security              (dual-sided guardrails, microVM isolation)
-  E – GENEVAL  · Evaluation & Trust    ← NEW (5-step eval loop, trace scoring)
+  E – GENEVAL  · Evaluation & Trust    (5-step eval loop, trace scoring, drift gate)
   E – GENSUST  · Sustainability        (right-sized model routing)
 """
 import logging
+import uuid
 
 from pillars import (
     GENCOSTBatchProcessor,
     GENOPSPromptManager,
     GENRELFanOutPublisher,
     GENRELCircuitBreaker,
+    GENRELMultiAgentCoordinator,
     GENPERFStreamHandler,
     GENSECGuardrailPerimeter,
     GENEVALEvaluationEngine,
+    ContinuousEvalLoop,
     GENSUSTIntentRouter,
 )
 from pillars.gensec import GuardrailIntervened
@@ -64,28 +70,36 @@ class CORPSEEOrchestrator:
     Usage:
         orc = CORPSEEOrchestrator()
 
-        # Real-time interactive query
+        # Real-time interactive query (single-agent path)
         result = orc.handle_query(user_query="...", account_id="ACC-001")
+
+        # Multi-agent loan assessment (Supervisor → 3 specialist sub-agents)
+        decision = orc.handle_multi_agent(query="...", account_id="ACC-001")
 
         # Background nightly bulk audit (GENCOST)
         job_arn = orc.submit_batch_audit()
 
         # Offline evaluation job (GENEVAL)
         eval_arn = orc.submit_evaluation_job()
+
+        # Continuous eval loop quality report
+        metrics = orc.eval_loop.rolling_metrics()
     """
 
     def __init__(self) -> None:
-        self.cost      = GENCOSTBatchProcessor()        # C
-        self.ops       = GENOPSPromptManager()          # O
-        self.rel_pub   = GENRELFanOutPublisher()        # R — fan-out
-        self.rel_cb    = GENRELCircuitBreaker()         # R — circuit breaker
-        self.perf      = GENPERFStreamHandler()         # P
-        self.sec       = GENSECGuardrailPerimeter()     # S
-        self.eval      = GENEVALEvaluationEngine()      # E (Evaluation)
-        self.sust      = GENSUSTIntentRouter()          # E (Sustainability)
+        self.cost         = GENCOSTBatchProcessor()           # C
+        self.ops          = GENOPSPromptManager()             # O
+        self.rel_pub      = GENRELFanOutPublisher()           # R — fan-out
+        self.rel_cb       = GENRELCircuitBreaker()            # R — circuit breaker
+        self.rel_ma       = GENRELMultiAgentCoordinator()     # R — multi-agent coord
+        self.perf         = GENPERFStreamHandler()            # P
+        self.sec          = GENSECGuardrailPerimeter()        # S
+        self.eval         = GENEVALEvaluationEngine()         # E (Evaluation)
+        self.eval_loop    = ContinuousEvalLoop(self.eval)     # E (Continuous loop)
+        self.sust         = GENSUSTIntentRouter()             # E (Sustainability)
 
     # ────────────────────────────────────────────────────────────────────────
-    # Primary pipeline — real-time interactive query
+    # Primary pipeline — real-time interactive query (single-agent)
     # ────────────────────────────────────────────────────────────────────────
 
     def handle_query(
@@ -97,7 +111,7 @@ class CORPSEEOrchestrator:
         run_eval:          bool = False,
     ) -> dict:
         """
-        Full CORPSEE pipeline for a real-time user query.
+        Full CORPSEE pipeline for a real-time user query (single-agent path).
 
         Steps:
           1. GENSEC  — scan untrusted input through guardrail perimeter.
@@ -198,6 +212,115 @@ class CORPSEEOrchestrator:
         }
 
     # ────────────────────────────────────────────────────────────────────────
+    # Multi-Agent pipeline — Supervisor → Fraud + Compliance + Risk
+    # ────────────────────────────────────────────────────────────────────────
+
+    def handle_multi_agent(
+        self,
+        query:          str,
+        account_id:     str  = "ACC-UNKNOWN",
+        session_id:     str | None = None,
+        broadcast_event: bool = True,
+    ) -> dict:
+        """
+        Full CORPSEE multi-agent pipeline for complex loan application assessments.
+
+        Macro Orchestration (GENREL):
+          Supervisor Agent decomposes query → fires Fraud + Compliance + Risk
+          sub-agents in parallel (each in isolated AgentCore microVM session).
+          GENRELMultiAgentCoordinator gates results on quality thresholds.
+
+        Continuous Evaluation (GENEVAL):
+          ContinuousEvalLoop records every assessment, detects drift, and
+          auto-triggers an offline Bedrock Evaluation job when quality drops.
+
+        Steps:
+          1. GENSEC  — guardrail input scan
+          2. GENREL  — multi-agent orchestration (Supervisor + 3 sub-agents)
+          3. GENREL  — fan-out broadcast
+          4. GENEVAL — record to continuous eval loop + drift check
+        """
+        session_id = session_id or f"ma-{uuid.uuid4().hex[:8]}"
+
+        logger.info("▶▶▶ MULTI-AGENT pipeline START  account=%s session=%s", account_id, session_id)
+
+        # ── Step 1 · S · GENSEC ───────────────────────────────────────────────
+        logger.info("Step 1 · GENSEC — guardrail input scan")
+        try:
+            self.sec.safe_execute(query)
+        except GuardrailIntervened:
+            logger.warning("GENSEC blocked input. Aborting multi-agent pipeline.")
+            return {
+                "status":  "BLOCKED",
+                "reason":  "Input failed Bedrock Guardrail check.",
+                "account": account_id,
+            }
+
+        # ── Step 2 · R · GENREL — Multi-Agent Orchestration ──────────────────
+        logger.info("Step 2 · GENREL — Supervisor → [Fraud | Compliance | Risk] parallel dispatch")
+        ma_result = self.rel_ma.orchestrate(query=query, session_id=session_id)
+
+        decision        = ma_result["decision"]
+        health_summary  = ma_result["health_summary"]
+        reliability     = ma_result["reliability"]
+
+        logger.info(
+            "  → decision=%s  risk=%s  reliability=%s  latency=%.0fms",
+            decision.get("final_decision"),
+            decision.get("overall_risk"),
+            reliability,
+            ma_result["total_ms"],
+        )
+
+        # ── Step 3 · R · GENREL — Fan-Out Broadcast ──────────────────────────
+        if broadcast_event:
+            logger.info("Step 3 · GENREL — fan-out broadcast of assessment event")
+            try:
+                self.rel_pub.broadcast_transaction(
+                    account_id=account_id,
+                    payload_summary=f"MultiAgent assessment: {decision.get('final_decision')} — {query[:150]}",
+                    tier="HighRisk" if decision.get("overall_risk") in ("HIGH", "CRITICAL") else "Standard",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Fan-out broadcast skipped: %s", exc)
+
+        # ── Step 4 · E · GENEVAL — Continuous Eval Loop ──────────────────────
+        logger.info("Step 4 · GENEVAL — recording to continuous eval loop")
+        sub_results = ma_result["decision"].get("sub_agents", [])
+        # Convert dicts back to lightweight proxy objects for eval_loop.collect()
+        class _R:
+            def __init__(self, d):
+                self.agent_name  = d["agent"]
+                self.self_score  = d["self_score"]
+                self.success     = d["success"]
+                self.response    = d["response"]
+        proxy_results = [_R(s) for s in sub_results]
+        self.eval_loop.collect(proxy_results, decision)
+
+        # Check for drift and auto-trigger offline eval if needed
+        drift_metrics = self.eval_loop.check_and_trigger()
+        logger.info(
+            "  → rolling avg_confidence=%.3f  success_rate=%.3f  drift=%s",
+            drift_metrics.get("avg_confidence") or 0,
+            drift_metrics.get("success_rate") or 0,
+            drift_metrics.get("drift_detected"),
+        )
+
+        logger.info("▶▶▶ MULTI-AGENT pipeline END  ✅")
+
+        return {
+            "status":        "OK",
+            "pipeline":      "MULTI_AGENT",
+            "account":       account_id,
+            "session":       session_id,
+            "decision":      decision,
+            "health":        health_summary,
+            "reliability":   reliability,
+            "eval_metrics":  drift_metrics,
+            "latency_ms":    ma_result["total_ms"],
+        }
+
+    # ────────────────────────────────────────────────────────────────────────
     # Batch pipeline — C · GENCOST
     # ────────────────────────────────────────────────────────────────────────
 
@@ -223,6 +346,13 @@ class CORPSEEOrchestrator:
         job_arn = self.eval.submit_model_evaluation_job(job_name=job_name)
         return {"status": "SUBMITTED", "jobArn": job_arn}
 
+    def eval_quality_report(self) -> dict:
+        """Return rolling quality metrics and edge cases from the continuous eval loop."""
+        return {
+            "metrics":     self.eval_loop.rolling_metrics(),
+            "edge_cases":  self.eval_loop.edge_case_report(),
+        }
+
 
 # ── CLI demo ─────────────────────────────────────────────────────────────────
 
@@ -242,22 +372,21 @@ if __name__ == "__main__":
     print(json.dumps(result, indent=2))
 
     print("\n" + "▓" * 64)
-    print("  CORPSEE DEMO — Real-time COMPLEX query with GENEVAL")
+    print("  CORPSEE DEMO — Multi-Agent Loan Assessment")
     print("▓" * 64)
-    result = orc.handle_query(
-        user_query=(
-            "Analyse the risk profile of this commercial loan application for a $4.2M "
-            "mixed-use property in Sydney CBD, considering current RBA rate environment, "
-            "tenant concentration risk, and APRA prudential standards CPS 220."
+    ma_result = orc.handle_multi_agent(
+        query=(
+            "Loan application: John Smith, 42, employed as a civil engineer ($185,000 p.a.). "
+            "Seeking $1.2M mortgage for a property in Mosman NSW. Property valuation: $1.5M. "
+            "LVR: 80%. Current debts: $45,000 car loan, $12,000 credit card. "
+            "No prior defaults. Two additional loan enquiries in the past 30 days."
         ),
         account_id="ACC-002",
-        session_id="SESSION-002",
-        run_eval=True,
+        session_id="SESSION-MA-001",
     )
-    print(json.dumps(result, indent=2))
+    print(json.dumps(ma_result, indent=2))
 
     print("\n" + "▓" * 64)
-    print("  CORPSEE DEMO — Offline evaluation job (GENEVAL)")
+    print("  CORPSEE DEMO — Eval Quality Report")
     print("▓" * 64)
-    eval_job = orc.submit_evaluation_job()
-    print(json.dumps(eval_job, indent=2))
+    print(json.dumps(orc.eval_quality_report(), indent=2))

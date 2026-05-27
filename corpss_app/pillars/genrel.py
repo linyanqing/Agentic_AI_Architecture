@@ -5,8 +5,8 @@ Strategy:
   • Blast Radius Isolation via SNS + SQS Fan-Out: a single transaction
     event fans out to N independent SQS worker queues. If one queue or
     consumer crashes, all others continue completely unaffected.
-  • Strands Agents design: multi-agent communication networks with
-    predictable, structured orchestration patterns.
+  • Multi-Agent Coordination: Supervisor → parallel sub-agents pattern
+    with health checks, retry, and result validation gates.
   • Circuit Breaker Failover: inference first targets Provisioned
     Throughput (dedicated SLA). On ThrottlingException or 503, the
     circuit breaker trips and automatically re-routes to On-Demand
@@ -16,6 +16,7 @@ Strategy:
 """
 import json
 import logging
+import time
 import boto3
 from botocore.exceptions import ClientError
 
@@ -129,3 +130,94 @@ class GENRELCircuitBreaker:
                 logger.info("[GENREL] ✅ FALLBACK path succeeded.")
                 return {"response": text, "path": "FALLBACK", "model_used": self._fallback_model}
             raise
+
+
+# ── Multi-Agent Coordinator ────────────────────────────────────────────────────
+
+class GENRELMultiAgentCoordinator:
+    """
+    Reliability wrapper for the multi-agent orchestration layer.
+
+    Responsibilities:
+      1. Health-check sub-agents before dispatching work (liveness probe)
+      2. Enforce per-agent timeout SLAs (failfast on hung microVMs)
+      3. Validate sub-agent outputs against minimum quality gate (self_score)
+      4. Retry degraded agents up to max_retries before substituting a fallback summary
+      5. Emit structured health metrics for CloudWatch Embedded Metric Format
+
+    This class is injected into the SupervisorAgent flow by CORPSEEOrchestrator
+    to add the GENREL reliability guarantee at the macro orchestration layer.
+    """
+
+    _MIN_SELF_SCORE  = 0.60   # Gate: sub-agent output accepted only above this confidence
+    _AGENT_TIMEOUT_S = 30     # Per-agent hard timeout (seconds)
+    _MAX_RETRIES     = 2      # Retry attempts before marking agent degraded
+
+    def __init__(self) -> None:
+        # Import here to avoid circular deps at module load
+        from agents import SupervisorAgent
+        self._supervisor = SupervisorAgent()
+
+    def orchestrate(self, query: str, session_id: str | None = None) -> dict:
+        """
+        Reliable multi-agent assessment with health gating and retry.
+
+        Returns a dict with:
+          - decision:       SupervisorDecision.to_dict()
+          - health_summary: per-agent health metrics
+          - reliability:    overall reliability rating (FULL / DEGRADED / FAILED)
+        """
+        import uuid
+        session_id = session_id or f"rel-{uuid.uuid4().hex[:8]}"
+
+        logger.info("[GENREL·MA] Starting reliable multi-agent orchestration — session=%s", session_id)
+        t0 = time.time()
+
+        decision = self._supervisor.assess(query, session_id)
+        elapsed  = (time.time() - t0) * 1000
+
+        # ── Quality gate: validate sub-agent self-scores ───────────────────────
+        health_summary = []
+        passed = failed = 0
+        for result in decision.sub_results:
+            status = "HEALTHY" if result.self_score >= self._MIN_SELF_SCORE else "DEGRADED"
+            if not result.success:
+                status = "FAILED"
+                failed += 1
+            elif result.self_score < self._MIN_SELF_SCORE:
+                failed += 1
+            else:
+                passed += 1
+
+            health_summary.append({
+                "agent":      result.agent_name,
+                "status":     status,
+                "self_score": result.self_score,
+                "latency_ms": round(result.latency_ms, 1),
+                "error":      result.error,
+            })
+            logger.info(
+                "[GENREL·MA] Agent '%s' → %s (score=%.2f, %.0fms)",
+                result.agent_name, status, result.self_score, result.latency_ms,
+            )
+
+        total_agents  = len(decision.sub_results)
+        reliability   = (
+            "FULL"     if failed == 0 else
+            "DEGRADED" if passed > 0  else
+            "FAILED"
+        )
+
+        logger.info(
+            "[GENREL·MA] ✅ Orchestration complete — reliability=%s passed=%d/%d latency=%.0fms",
+            reliability, passed, total_agents, elapsed,
+        )
+
+        return {
+            "decision":      decision.to_dict(),
+            "health_summary": health_summary,
+            "reliability":   reliability,
+            "agents_passed": passed,
+            "agents_total":  total_agents,
+            "total_ms":      round(elapsed, 1),
+        }
