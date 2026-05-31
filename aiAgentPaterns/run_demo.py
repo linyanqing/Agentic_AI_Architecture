@@ -17,13 +17,24 @@ Demonstrates all 8 steps of the autonomous agent loop:
   Step 8  Token Reduction & Output   ← GENCOST flush + final answer
 
 Usage:
-  python run_demo.py           # Full autonomous loop (calls live Bedrock)
-  python run_demo.py --dry-run # Mock mode: no AWS calls, see structure only
+  python run_demo.py                          # Live Bedrock (Nova Pro default)
+  python run_demo.py --dry-run                # No AWS calls — mock trace only
+  python run_demo.py --model amazon.nova-lite-v1:0   # Override model
+  python run_demo.py --model anthropic.claude-3-5-sonnet-20241022-v2:0
+
+Model selection (ap-southeast-2 / rackspace-sydney):
+  amazon.nova-pro-v1:0   ← DEFAULT  Amazon-native, separate daily quota pool
+  amazon.nova-lite-v1:0             Cheaper, highest throughput quota
+  anthropic.claude-3-5-sonnet-20241022-v2:0   Shares account daily quota
+
+  If you hit ThrottlingException / daily quota, the loop automatically
+  falls back to amazon.nova-lite-v1:0 before giving up.
 
 AWS Profile: rackspace-sydney  |  Region: ap-southeast-2
 """
 import json
 import logging
+import os
 import sys
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
@@ -231,21 +242,36 @@ def dry_run():
 #  LIVE RUN — calls real Bedrock with live model reasoning
 # ══════════════════════════════════════════════════════════════════════════════
 
-def live_run():
+def live_run(model_override: str | None = None, profile_override: str | None = None):
     """Run the autonomous agent loop with live Amazon Bedrock inference."""
     from autonomous_agent_loop import AgentLoop
-    from config import DEMO_SESSION_ID
+    from config import DEMO_SESSION_ID, MODEL_PRIMARY, MODEL_FALLBACK, AWS_PROFILE
+
+    active_model   = model_override   or MODEL_PRIMARY
+    active_profile = profile_override or AWS_PROFILE
+
+    # Let env var win for profile if explicitly passed
+    if profile_override:
+        os.environ["AWS_PROFILE"] = profile_override
 
     print("\n" + "▓" * 64)
     print("  AUTONOMOUS AGENT LOOP — LIVE (Amazon Bedrock)")
     print("  Enterprise scenario: authentication exception incident")
     print("▓" * 64)
+    print(f"\n  Profile  : {active_profile}")
+    print(f"  Model    : {active_model}")
+    print(f"  Fallback : {MODEL_FALLBACK}")
+    print(f"  Region   : ap-southeast-2\n")
 
     USER_INPUT = (
         "Our recent deployment is throwing authentication exceptions. Fix it."
     )
 
-    loop = AgentLoop(session_id=DEMO_SESSION_ID)
+    loop = AgentLoop(
+        session_id=DEMO_SESSION_ID,
+        model_id=active_model,
+        aws_profile=active_profile,
+    )
 
     try:
         final_answer = loop.run(user_input=USER_INPUT)
@@ -260,16 +286,43 @@ def live_run():
 
     except Exception as exc:
         logger.error("Live run failed: %s", exc)
-        logger.info("Falling back to dry-run mode …")
+        logger.info("All models throttled — falling back to dry-run mode …")
+        print("\n  ℹ️   All models throttled (daily quota). Showing dry-run trace instead.\n")
         dry_run()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    dry = "--dry-run" in sys.argv or "-d" in sys.argv
+def _parse_args() -> dict:
+    """Minimal arg parser (no argparse dependency)."""
+    args = sys.argv[1:]
+    result = {"dry": False, "model": None, "profile": None}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--dry-run", "-d"):
+            result["dry"] = True
+        elif a == "--model" and i + 1 < len(args):
+            result["model"] = args[i + 1]
+            i += 1
+        elif a.startswith("--model="):
+            result["model"] = a.split("=", 1)[1]
+        elif a == "--profile" and i + 1 < len(args):
+            result["profile"] = args[i + 1]
+            i += 1
+        elif a.startswith("--profile="):
+            result["profile"] = a.split("=", 1)[1]
+        i += 1
+    return result
 
-    if dry:
+
+if __name__ == "__main__":
+    opts = _parse_args()
+
+    if opts["dry"]:
         dry_run()
     else:
-        live_run()
+        live_run(
+            model_override=opts["model"],
+            profile_override=opts["profile"],
+        )

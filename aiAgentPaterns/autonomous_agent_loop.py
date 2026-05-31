@@ -33,16 +33,25 @@ import time
 from typing import Any
 
 import boto3
+from botocore.exceptions import ClientError
 
 from config import (
     AWS_PROFILE,
     AWS_REGION,
     MAX_ITERATIONS,
+    MAX_RETRIES,
+    MODEL_FALLBACK,
     MODEL_ID,
+    RETRY_BASE_DELAY_S,
     TOKEN_FLUSH_BUDGET,
 )
 from memory import SessionMemory
 from tools  import TOOL_CONFIG, execute_tool
+
+# Errors that are worth retrying (transient capacity issues)
+_RETRYABLE = {"ThrottlingException", "ServiceUnavailableException", "ModelTimeoutException"}
+# Errors that indicate daily/hard quota exhaustion — fallback to lighter model
+_QUOTA_ERRORS = {"ThrottlingException"}
 
 logger = logging.getLogger(__name__)
 
@@ -110,21 +119,24 @@ class AgentLoop:
 
     def __init__(
         self,
-        session_id:  str = "sydney-client-901",
-        model_id:    str = MODEL_ID,
-        aws_profile: str = AWS_PROFILE,
-        aws_region:  str = AWS_REGION,
+        session_id:     str = "sydney-client-901",
+        model_id:       str = MODEL_ID,
+        fallback_model: str = MODEL_FALLBACK,
+        aws_profile:    str = AWS_PROFILE,
+        aws_region:     str = AWS_REGION,
     ) -> None:
-        self.session_id = session_id
-        self.model_id   = model_id
-        self.memory     = SessionMemory(session_id=session_id)
+        self.session_id     = session_id
+        self.model_id       = model_id
+        self._active_model  = model_id      # may be switched to fallback on quota error
+        self._fallback_model = fallback_model
+        self.memory         = SessionMemory(session_id=session_id)
 
         sess = boto3.Session(profile_name=aws_profile, region_name=aws_region)
         self._bedrock = sess.client("bedrock-runtime")
 
         logger.info(
-            "[LOOP] Initialized — model=%s region=%s session=%s",
-            model_id, aws_region, session_id,
+            "[LOOP] Initialized — model=%s fallback=%s region=%s session=%s",
+            model_id, fallback_model, aws_region, session_id,
         )
 
     # ── Public entry point ────────────────────────────────────────────────────
@@ -334,27 +346,80 @@ class AgentLoop:
 
     def _call_model(self, messages: list[dict], system_prompt: str) -> dict:
         """
-        Invoke Bedrock converse API with the full conversation history,
-        tool definitions, and system prompt.
+        Invoke Bedrock converse API with exponential backoff retry and
+        automatic model fallback on quota exhaustion.
+
+        Retry strategy:
+          • Retryable errors (ThrottlingException, ServiceUnavailable):
+            exponential backoff — base 2s, doubles each attempt.
+          • After MAX_RETRIES on primary model: switch to fallback model
+            (lighter quota pool) and retry once more.
+          • Non-retryable errors: raise immediately.
 
         The converse API is stateless — we reconstruct the full conversation
         each call. AgentCore manages the session state boundary in production.
         """
-        logger.debug("[LOOP] Calling Bedrock — %d messages in history", len(messages))
-        try:
-            return self._bedrock.converse(
-                modelId=self.model_id,
-                messages=messages,
-                system=[{"text": system_prompt}],
-                toolConfig=TOOL_CONFIG,
-                inferenceConfig={
-                    "maxTokens":   1_024,
-                    "temperature": 0.1,   # Low temp → deterministic tool selection
-                },
-            )
-        except Exception as exc:
-            logger.error("[LOOP] Bedrock call failed: %s", exc)
-            raise
+        logger.debug("[LOOP] Calling Bedrock — model=%s msgs=%d", self._active_model, len(messages))
+
+        last_exc = None
+        for attempt in range(1, MAX_RETRIES + 2):   # +1 extra slot for fallback
+            try:
+                return self._bedrock.converse(
+                    modelId=self._active_model,
+                    messages=messages,
+                    system=[{"text": system_prompt}],
+                    toolConfig=TOOL_CONFIG,
+                    inferenceConfig={
+                        "maxTokens":   1_024,
+                        "temperature": 0.1,   # Low temp → deterministic tool selection
+                    },
+                )
+            except ClientError as exc:
+                code = exc.response["Error"]["Code"]
+                msg  = exc.response["Error"]["Message"]
+
+                if code not in _RETRYABLE:
+                    logger.error("[LOOP] Non-retryable error (%s): %s", code, msg)
+                    raise
+
+                last_exc = exc
+
+                # After exhausting retries on primary → try fallback model once
+                if attempt > MAX_RETRIES:
+                    if self._active_model != self._fallback_model:
+                        logger.warning(
+                            "[LOOP] 🚨 Quota exhausted on %s — switching to fallback model %s",
+                            self._active_model, self._fallback_model,
+                        )
+                        print(
+                            f"\n  ⚠️   Throttled on {self._active_model} (daily quota)."
+                            f"\n  🔄  Switching to fallback: {self._fallback_model}\n"
+                        )
+                        self._active_model = self._fallback_model
+                        # One more attempt with fallback
+                        try:
+                            return self._bedrock.converse(
+                                modelId=self._active_model,
+                                messages=messages,
+                                system=[{"text": system_prompt}],
+                                toolConfig=TOOL_CONFIG,
+                                inferenceConfig={"maxTokens": 1_024, "temperature": 0.1},
+                            )
+                        except ClientError as fb_exc:
+                            logger.error("[LOOP] Fallback model also failed: %s", fb_exc)
+                            raise fb_exc
+                    else:
+                        raise last_exc
+
+                wait = RETRY_BASE_DELAY_S * (2 ** (attempt - 1))
+                logger.warning(
+                    "[LOOP] %s (attempt %d/%d) — retrying in %ds …",
+                    code, attempt, MAX_RETRIES, wait,
+                )
+                print(f"  ⏳  {code} (attempt {attempt}/{MAX_RETRIES}) — retrying in {wait}s …")
+                time.sleep(wait)
+
+        raise last_exc  # should not reach here
 
     @staticmethod
     def _extract_text(content_blocks: list[dict]) -> str:
