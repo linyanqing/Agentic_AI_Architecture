@@ -117,6 +117,246 @@ The agent builds its task list based on the initial reasoning call — in produc
 
 ---
 
+## ⚙️ Core Mechanism — How the LLM Knows Which Tool to Call
+
+The LLM has no built-in knowledge of your tools. There are three distinct layers
+that work together to make tool selection happen.
+
+### Layer 1 — Tool Registration: Teaching the LLM what tools exist
+
+Every call to `bedrock.converse()` includes a `toolConfig` block — this is how
+the LLM learns what tools are available. Without it, the model can only output text.
+
+```python
+bedrock.converse(
+    modelId=self._active_model,
+    messages=messages,
+    system=[{"text": system_prompt}],
+    toolConfig=TOOL_CONFIG,          # ← registration happens here, every call
+)
+```
+
+`TOOL_CONFIG` is built in `tools/__init__.py` from three `toolSpec` schemas.
+Each schema has exactly three fields the LLM reads:
+
+```python
+"toolSpec": {
+    "name":        "query_deployment_ledger",   # what the tool is called
+    "description": "Query the deployment audit ledger... Use this to identify
+                    WHICH service was recently deployed when investigating
+                    production incidents.",      # WHEN to use it ← most important
+    "inputSchema": { ... }                       # what arguments to pass
+}
+```
+
+**The `description` field is the routing logic.** It is plain English written by
+you, encoding the domain knowledge of when this tool should be chosen over others.
+The model reads all descriptions and uses them like a menu before acting.
+
+### Layer 2 — Tool Selection: How the LLM decides which tool and when
+
+The LLM never runs code — it only outputs text. When it wants a tool, it outputs
+a structured `toolUse` block instead of a plain text response, and Bedrock signals
+this with `stopReason = "tool_use"`:
+
+```json
+{
+  "toolUse": {
+    "toolUseId": "call-abc123",
+    "name":      "query_deployment_ledger",
+    "input":     { "client_id": "QANTAS-AU", "limit": 1 }
+  }
+}
+```
+
+The model's internal reasoning:
+> *"The user reported an auth exception. I need to know which service was deployed.
+> The tool `query_deployment_ledger` says 'Use this to identify WHICH service was
+> recently deployed when investigating production incidents.' That matches. I'll
+> call it with `client_id = QANTAS-AU` from the session memory."*
+
+The decision is entirely inside the model. **The quality of your `description`
+fields directly controls the quality of tool selection.**
+
+### Layer 3 — Dispatch: How your code executes what the LLM chose
+
+Once `stopReason == "tool_use"`, the `while` loop in `run()` does three things:
+
+**A — Extract** what the model requested:
+```python
+tool_name   = block["toolUse"]["name"]      # e.g. "query_deployment_ledger"
+tool_input  = block["toolUse"]["input"]     # e.g. {"client_id": "QANTAS-AU"}
+tool_use_id = block["toolUse"]["toolUseId"]
+```
+
+**B — Dispatch** to the Python function via `TOOL_REGISTRY` in `tools/__init__.py`:
+```python
+TOOL_REGISTRY = {
+    "query_deployment_ledger": query_deployment_ledger,  # Python function
+    "read_s3_log_file":        read_s3_log_file,
+    "send_notification":       send_notification,
+}
+result = TOOL_REGISTRY[tool_name](**tool_input)
+```
+
+**C — Return** the result as a `toolResult` block and re-call `converse()`:
+```python
+{"toolResult": {"toolUseId": tool_use_id, "content": [{"json": result}]}}
+```
+
+The model reads the result, reasons again, and either requests another tool
+(`stopReason = "tool_use"`) or produces its final answer (`stopReason = "end_turn"`).
+
+### The complete data flow
+
+```
+YOUR CODE                           LLM (inside Bedrock)
+──────────────────────────────────────────────────────────────
+Pass toolConfig (3 schemas)   →    Reads descriptions, builds
+                                   mental map of available tools
+
+                              ←    stopReason = "tool_use"
+                                   toolUse: {name: "query_deployment_ledger",
+                                             input: {client_id: "QANTAS-AU"}}
+
+TOOL_REGISTRY["query_..."]()
+→ runs Python function
+→ returns {"deployments": [...]}
+
+Pass toolResult back          →    Reads result, reasons:
+                                   "Now I have the app name + S3 URI.
+                                    I need the log file next."
+                              ←    stopReason = "tool_use"
+                                   toolUse: {name: "read_s3_log_file", ...}
+
+read_s3_log_file(uri=...)
+→ returns log content
+
+Pass toolResult back          →    Reads log, diagnosis complete.
+                              ←    stopReason = "end_turn"
+                                   Plain text final answer.
+
+Loop exits. Return to user.
+```
+
+---
+
+## 🏆 Agent Quality — The Three Dimensions
+
+The same base model can perform dramatically differently as an agent depending
+on three independent quality dimensions. This is what distinguishes agents like
+Claude Code and Rovo Dev from a generic loop like this reference implementation.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      AGENT QUALITY                           │
+│                                                              │
+│  1. REASONING    ← base model capability + system prompt    │
+│  2. PLANNING     ← planning strategy + memory architecture  │
+│  3. TOOL CALLING ← tool description quality + tool design   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Dimension 1 — Reasoning Quality
+
+Comes from two sources: the **base model** and the **system prompt**.
+
+A stronger model, given the same ambiguous input, reasons before acting:
+> *"I must not guess. I need to discover context first — query what was recently
+> deployed before looking at any logs."*
+
+A weaker model might immediately call a log tool with an invented service name,
+fail, and loop badly. Claude Code and Rovo Dev use Claude Sonnet/Opus class
+models — frontier-level reasoning — as their base.
+
+The **system prompt** adds domain-specific reasoning rules on top. Claude Code's
+system prompt encodes decades of software engineering best practices: explore
+before editing, verify after every change, never assume file structure.
+
+### Dimension 2 — Planning Quality
+
+Architectural choices matter more than model choice here.
+
+| Agent | Planning approach | Characteristic |
+|---|---|---|
+| This demo | Plan-and-Execute | One upfront LLM plan, then execute linearly |
+| Claude Code | ReAct per step | Reason → Act → Observe → Re-reason each iteration |
+| Rovo Dev | Workflow-aware | Maps request to Atlassian workflow before any code |
+
+
+Claude Code does not just plan at the start — it re-evaluates after every tool
+result, which means it recovers gracefully from unexpected findings mid-task.
+Rovo Dev knows to check Jira tickets and PR review comments before touching code,
+because its planning is built around Atlassian's collaboration model.
+
+### Dimension 3 — Tool Calling Quality
+
+The most underappreciated dimension. **The `description` in `toolSpec` is the
+routing logic** — its quality directly determines whether the model picks the
+right tool at the right moment.
+
+```
+❌  Poor description (causes wrong tool selection):
+    "Read a file from S3"
+
+✅  Production-grade description (Claude Code / Rovo Dev level):
+    "Read the contents of a log file from Amazon S3.
+     Use the S3 URI obtained from query_deployment_ledger — never guess a path.
+     Apply grep_filter to return only ERROR/CRITICAL lines (reduces token payload).
+     Use ONLY after you have a confirmed URI from a prior tool result."
+```
+
+The rich description gives the model: **when** to call it, **what guard rails**
+apply, **why** to use the optional filter, and **what precondition** must be true.
+Claude Code's tool descriptions for `Read`, `Edit`, `Bash`, and `Write` encode
+years of software engineering best practices in plain English — that is a
+significant part of why it performs reliably across diverse coding tasks.
+
+### How this demo compares to Claude Code and Rovo Dev
+
+```
+┌──────────────────┬──────────────────┬───────────────────┬──────────────────┐
+│                  │  This Demo Loop  │   Claude Code     │   Rovo Dev       │
+├──────────────────┼──────────────────┼───────────────────┼──────────────────┤
+│ Base model       │ Nova Pro / Lite  │ Claude Sonnet /   │ Claude           │
+│                  │                  │ Opus 4.x          │ (Sonnet class)   │
+├──────────────────┼──────────────────┼───────────────────┼──────────────────┤
+│ System prompt    │ Generic infra    │ Deep software      │ Atlassian        │
+│ domain depth     │ support pattern  │ engineering rules  │ workflow rules   │
+├──────────────────┼──────────────────┼───────────────────┼──────────────────┤
+│ Planning         │ LLM upfront plan │ ReAct per step,   │ Workflow-aware,  │
+│ strategy         │ (Plan+Execute)   │ verify after each │ Jira-first       │
+├──────────────────┼──────────────────┼───────────────────┼──────────────────┤
+│ Tool set         │ 3 mock tools     │ 15+ real tools:   │ Jira, Confluence,│
+│                  │ (demo scenario)  │ Read, Edit, Bash, │ Bitbucket, code  │
+│                  │                  │ Write, WebSearch… │ search, PR review│
+├──────────────────┼──────────────────┼───────────────────┼──────────────────┤
+│ Tool description │ Good for demo    │ Production-grade,  │ Atlassian API    │
+│ quality          │ illustration     │ years of tuning   │ optimised        │
+├──────────────────┼──────────────────┼───────────────────┼──────────────────┤
+│ Memory           │ Two-tier manual  │ Context window +  │ Atlassian cloud  │
+│                  │ (demo concept)   │ file system state │ session state    │
+└──────────────────┴──────────────────┴───────────────────┴──────────────────┘
+```
+
+### The key insight
+
+This demo loop and Claude Code implement **the same architectural pattern** —
+`stopReason == "tool_use"` drives the loop, tool descriptions route decisions,
+tool results feed back into reasoning. The Bedrock `converse` API and Anthropic
+API use the same underlying mechanism.
+
+What makes Claude Code exceptional is not a different architecture — it is
+**software engineering knowledge encoded into its system prompt and tool
+descriptions**, combined with a frontier reasoning model and a rich tool ecosystem
+built for coding workflows.
+
+This demo is a **transparent reference implementation of the pattern**.
+Claude Code is a **highly optimised production specialisation of the same pattern**.
+The skeleton is identical — the quality of what is inside each layer is what differs.
+
+---
+
 ## 🚀 Running the Demo
 
 ### Quick Start (no AWS needed)
