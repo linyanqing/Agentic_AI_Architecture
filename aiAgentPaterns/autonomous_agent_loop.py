@@ -20,9 +20,26 @@ How the loop works with Bedrock converse API:
 Architecture alignment:
   Orchestration Framework  →  This file's AgentLoop class
   Harness (AgentCore)      →  The _execute_tool_calls() dispatch layer
-  Short-term memory        →  session_memory.SessionMemory.short_term
-  Long-term memory         →  session_memory.SessionMemory.long_term (flush)
+  Short-term memory        →  memory.SessionMemory.short_term
+  Long-term memory         →  memory.SessionMemory.long_term (flush)
   Tool integrations        →  tools/ package (MCP Postgres, S3, SNS)
+
+Design decisions — hardcoded vs dynamic:
+  ┌──────────────────────────────────────────────┬────────────────────┐
+  │  Element                                     │  Who decides?      │
+  ├──────────────────────────────────────────────┼────────────────────┤
+  │  Step banner labels                          │  Runtime context   │
+  │    (derived from actual tool name + iter)    │  (not a dict)      │
+  ├──────────────────────────────────────────────┼────────────────────┤
+  │  Task tree (T1, T2, … Tn)                   │  LLM Planner       │
+  │    (Plan-and-Execute pattern, Nova Micro)    │  (not hardcoded)   │
+  ├──────────────────────────────────────────────┼────────────────────┤
+  │  Which tool to call next                     │  Executor LLM      │
+  ├──────────────────────────────────────────────┼────────────────────┤
+  │  Tool arguments                              │  Executor LLM      │
+  ├──────────────────────────────────────────────┼────────────────────┤
+  │  When to stop looping (end_turn)             │  Executor LLM      │
+  └──────────────────────────────────────────────┴────────────────────┘
 """
 from __future__ import annotations
 
@@ -45,54 +62,84 @@ from config import (
     RETRY_BASE_DELAY_S,
     TOKEN_FLUSH_BUDGET,
 )
-from memory import SessionMemory
+from memory import SessionMemory, TaskNode
 from tools  import TOOL_CONFIG, execute_tool
-
-# Errors that are worth retrying (transient capacity issues)
-_RETRYABLE = {"ThrottlingException", "ServiceUnavailableException", "ModelTimeoutException"}
-# Errors that indicate daily/hard quota exhaustion — fallback to lighter model
-_QUOTA_ERRORS = {"ThrottlingException"}
 
 logger = logging.getLogger(__name__)
 
-# ── Step banners ──────────────────────────────────────────────────────────────
-_STEPS = {
-    1: ("Chat History Ingestion",            "📥"),
-    2: ("Reasoning — Initial Reflection",    "🧠"),
-    3: ("Planning — Task Tree Generation",   "📋"),
-    4: ("Tool Execution (MCP Postgres)",     "🔌"),
-    5: ("Observation & Self-Reflection",     "🔍"),
-    6: ("Dynamic Plan Update & Tool Call",   "🔄"),
-    7: ("Secondary Tool Execution (S3)",     "☁️ "),
-    8: ("Token Reduction & Final Output",    "🗜️ "),
-}
+# Errors that are worth retrying (transient capacity issues)
+_RETRYABLE    = {"ThrottlingException", "ServiceUnavailableException", "ModelTimeoutException"}
 
-def _step(n: int, detail: str = "") -> None:
-    label, icon = _STEPS.get(n, ("", ""))
+
+# ── Step banner helper (dynamic, not a lookup dict) ───────────────────────────
+
+def _step_banner(
+    number:    int,
+    label:     str,
+    icon:      str = "▶",
+    detail:    str = "",
+) -> None:
+    """
+    Print a step banner.
+
+    Labels are passed in at call time, derived from runtime context
+    (the actual tool name, iteration count, stopReason, etc.) rather
+    than looked up from a static dictionary.  This means the banner
+    accurately reflects WHAT IS ACTUALLY HAPPENING, not a pre-written
+    script — e.g. "Tool Call 3 · send_notification" rather than
+    the generic "Step 7 · Secondary Tool Execution".
+    """
     bar = "─" * 60
     print(f"\n{bar}")
-    print(f"  {icon}  Step {n} · {label}")
+    print(f"  {icon}  Step {number} · {label}")
     if detail:
         print(f"     {detail}")
     print(bar)
 
 
-# ── System prompt ─────────────────────────────────────────────────────────────
-_SYSTEM_PROMPT = """\
+# ── System prompts ────────────────────────────────────────────────────────────
+
+_PLANNER_PROMPT = """\
+You are a task planning assistant for an enterprise infrastructure support system.
+
+Available tools:
+{tool_names}
+
+A support agent has received this request:
+"{user_input}"
+
+Context about the client session:
+{memory_context}
+
+Your job: produce a concise, ordered task list the agent must complete to fully
+resolve this request. Each task should map to one or two tool calls.
+
+Respond ONLY with a JSON array. No explanation, no markdown fences.
+Format:
+[
+  {{"id": "T1", "description": "...", "tool_hint": "<tool_name_or_null>"}},
+  {{"id": "T2", "description": "...", "tool_hint": "<tool_name_or_null>"}},
+  ...
+]
+"""
+
+_EXECUTOR_SYSTEM_PROMPT = """\
 You are an autonomous infrastructure support agent for an Australian enterprise cloud platform.
 You operate in a strict agentic loop: Reason → Plan → Act → Observe → Re-Plan → Act → Summarize.
 
 RULES:
 1. Never guess. Always query tools to discover facts before drawing conclusions.
-2. After each tool result, explicitly state: what you now know, what is still unknown, and your next action.
-3. Build and maintain an internal task list. Mark tasks DONE only when you have tool evidence.
-4. When you have fully diagnosed the issue AND have a concrete resolution, notify the client team
-   using send_notification, then provide a final human-readable summary.
+2. After each tool result, explicitly state: what you now know, what is still unknown,
+   and your next action.
+3. Work through the task list below in order. Mark each task complete only when you
+   have tool evidence — not before.
+4. When you have fully diagnosed the issue AND have a concrete resolution, notify the
+   client team using send_notification, then provide a final human-readable summary.
 5. Be concise. The client is under incident pressure — no preamble, no filler.
 
 OUTPUT FORMAT for reasoning steps (before final answer):
   OBSERVATION: <what the tool result tells you>
-  GAP: <what is still unknown>
+  GAP:         <what is still unknown>
   NEXT ACTION: <exactly what you will do next and why>
 
 {memory_context}
@@ -101,20 +148,21 @@ OUTPUT FORMAT for reasoning steps (before final answer):
 
 class AgentLoop:
     """
-    Autonomous agent loop orchestrator.
+    Autonomous agent loop orchestrator — Plan-and-Execute pattern.
 
-    Manages the full 8-step cycle:
-      Step 1  Ingest chat history + session memory
-      Step 2  Initial reasoning reflection
-      Step 3  Dynamic task tree construction
-      Step 4  Primary tool execution (MCP Postgres deployment ledger)
-      Step 5  Observation and self-reflection
-      Step 6  Plan update — secondary tool selection
-      Step 7  Secondary tool execution (S3 log retrieval)
-      Step 8  GENCOST token reduction + final summarized output
+    Two-model architecture:
+      Planner  (Nova Micro / lightweight) — Step 3: generates the task tree as JSON
+      Executor (Nova Pro  / frontier)     — Steps 4–7: works through each task via tools
 
-    Each call to .run() is idempotent — subsequent calls resume from
-    the same SessionMemory object (simulating session persistence).
+    This separates WHAT to do (cheap, fast planning) from HOW to do it
+    (expensive, careful execution), which is the production best practice for
+    cost-efficient agentic systems.
+
+    Step labels: derived from runtime context (actual tool name, iteration,
+    stopReason) — not from a hardcoded lookup dict.
+
+    Task tree: generated by the Planner LLM from the user's input and session
+    memory — not hardcoded — so the same loop handles any request type.
     """
 
     def __init__(
@@ -122,21 +170,23 @@ class AgentLoop:
         session_id:     str = "sydney-client-901",
         model_id:       str = MODEL_ID,
         fallback_model: str = MODEL_FALLBACK,
+        planner_model:  str = "amazon.nova-lite-v1:0",   # lightweight for planning
         aws_profile:    str = AWS_PROFILE,
         aws_region:     str = AWS_REGION,
     ) -> None:
-        self.session_id     = session_id
-        self.model_id       = model_id
-        self._active_model  = model_id      # may be switched to fallback on quota error
+        self.session_id      = session_id
+        self.model_id        = model_id
+        self._active_model   = model_id
         self._fallback_model = fallback_model
-        self.memory         = SessionMemory(session_id=session_id)
+        self._planner_model  = planner_model
+        self.memory          = SessionMemory(session_id=session_id)
 
         sess = boto3.Session(profile_name=aws_profile, region_name=aws_region)
         self._bedrock = sess.client("bedrock-runtime")
 
         logger.info(
-            "[LOOP] Initialized — model=%s fallback=%s region=%s session=%s",
-            model_id, fallback_model, aws_region, session_id,
+            "[LOOP] Initialized — executor=%s planner=%s fallback=%s session=%s",
+            model_id, planner_model, fallback_model, session_id,
         )
 
     # ── Public entry point ────────────────────────────────────────────────────
@@ -153,43 +203,43 @@ class AgentLoop:
         # ─────────────────────────────────────────────────────────────────────
         # STEP 1 · Chat History Ingestion
         # ─────────────────────────────────────────────────────────────────────
-        _step(1, f'User: "{textwrap.shorten(user_input, 70)}"')
+        _step_banner(
+            number=1, icon="📥", label="Chat History Ingestion",
+            detail=f'User: "{textwrap.shorten(user_input, 65)}"',
+        )
         self.memory.iteration_count = 0
 
-        # Pre-load known session variables (in prod: pulled from DynamoDB/S3)
-        self.memory.set("active_account",  "Qantas-AU-Prod")
-        self.memory.set("client_id",       "QANTAS-AU")
-        self.memory.set("contact_email",   "oncall@qantas.com.au")
-        self.memory.set("incident_id",     "INC-2026-001")
+        # Pre-load session context (in production: pulled from DynamoDB/S3
+        # keyed by the authenticated user's session token)
+        self.memory.set("active_account", "Qantas-AU-Prod")
+        self.memory.set("client_id",      "QANTAS-AU")
+        self.memory.set("contact_email",  "oncall@qantas.com.au")
+        self.memory.set("incident_id",    "INC-2026-001")
 
         print(f"\n  Session ID      : {self.session_id}")
         print(f"  Active account  : {self.memory.get('active_account')}")
         print(f"  Incident        : {self.memory.get('incident_id')}")
-        print(f"  Short-term vars : {list(self.memory.short_term.keys())}")
 
-        # Build initial messages list
+        # ─────────────────────────────────────────────────────────────────────
+        # STEP 2 · Reasoning — Initial Reflection
+        # ─────────────────────────────────────────────────────────────────────
+        _step_banner(
+            number=2, icon="🧠", label="Reasoning — Initial Reflection",
+            detail="Executor LLM assesses the request before deciding any action",
+        )
+
+        system_prompt = _EXECUTOR_SYSTEM_PROMPT.format(
+            memory_context=self.memory.build_context_block(),
+        )
         messages: list[dict] = [
             {"role": "user", "content": [{"text": user_input}]},
         ]
 
-        # ─────────────────────────────────────────────────────────────────────
-        # STEP 2 · Reasoning — Initial Reflection (first model call)
-        # ─────────────────────────────────────────────────────────────────────
-        _step(2, "LLM processes input + memory context before deciding any action")
-
-        system_prompt = _SYSTEM_PROMPT.format(
-            memory_context=self.memory.build_context_block()
-        )
-
-        # First Bedrock call — model reflects and produces its initial plan
-        response = self._call_model(messages, system_prompt)
-        stop_reason = response["stopReason"]
+        response      = self._call_executor(messages, system_prompt)
+        stop_reason   = response["stopReason"]
         assistant_msg = response["output"]["message"]
-
-        # Append assistant's first response to the conversation
         messages.append({"role": "assistant", "content": assistant_msg["content"]})
 
-        # Extract and display any text reasoning the model produced
         initial_text = self._extract_text(assistant_msg["content"])
         if initial_text:
             print(f"\n  Model's initial reflection:\n")
@@ -197,47 +247,80 @@ class AgentLoop:
                 print(f"    {line}")
 
         # ─────────────────────────────────────────────────────────────────────
-        # STEP 3 · Planning — Task Tree Generation
-        # The model's first reasoning implicitly defines tasks; we surface
-        # them by parsing its NEXT ACTION statements and creating explicit
-        # TaskNodes in memory. In production, a structured planner sub-call
-        # (Nova Micro) extracts a formal JSON task list.
+        # STEP 3 · Planning — LLM-Generated Task Tree
+        #
+        # The Planner LLM (Nova Micro / Nova Lite — cheap) receives the user
+        # request + available tools and produces a JSON task list.
+        #
+        # WHY separate from the executor?
+        #   • Planning is a structured, low-complexity call → use a smaller model
+        #   • Decouples WHAT to do from HOW to do it (Plan-and-Execute pattern)
+        #   • Task list adapts to any request — no hardcoded T1/T2/T3
+        #   • Enables replanning mid-loop if the situation changes
         # ─────────────────────────────────────────────────────────────────────
-        _step(3, "Agent constructs its internal task tree before executing any tool")
+        _step_banner(
+            number=3, icon="📋", label="Planning — LLM-Generated Task Tree",
+            detail=f"Planner model: {self._planner_model}",
+        )
 
-        self.memory.add_task("T1", "Query deployment ledger for recent changes under Qantas-AU-Prod")
-        self.memory.add_task("T2", "Retrieve error log file from S3 URI identified in T1")
-        self.memory.add_task("T3", "Diagnose root cause from log content")
-        self.memory.add_task("T4", "Notify client engineering team with resolution details")
+        tasks = self._llm_plan(user_input)
+        if not tasks:
+            # Planner failed or returned nothing — executor will self-plan
+            logger.warning("[LOOP] Planner returned no tasks; executor will self-direct")
+            print("  ⚠️   Planner returned no tasks — executor will self-direct via tool calls")
+        else:
+            for t in tasks:
+                self.memory.add_task(t["id"], t["description"])
+            print(f"\n  LLM-generated task tree ({len(tasks)} tasks):")
+            print(self.memory.task_summary())
 
-        print(f"\n  Initial task tree:")
-        print(self.memory.task_summary())
+        # Build a tool→task mapping from the planner's tool_hint annotations.
+        # This replaces the hardcoded {"query_deployment_ledger": "T1", ...} dict.
+        tool_task_map: dict[str, str] = {
+            t["tool_hint"]: t["id"]
+            for t in tasks
+            if t.get("tool_hint")
+        }
+        logger.info("[LOOP] Tool→task map from planner: %s", tool_task_map)
 
         # ─────────────────────────────────────────────────────────────────────
-        # MAIN AGENTIC LOOP
-        # Steps 4 → 7 iterate here until the model issues no more tool calls
+        # MAIN AGENTIC LOOP  (Steps 4 → 7, dynamic iterations)
+        #
+        # The loop drives itself entirely from the model's stopReason:
+        #   "tool_use" → executor wants to call a tool → execute → loop back
+        #   "end_turn" → executor has its final answer → exit
+        #
+        # Step banner labels are generated from the ACTUAL tool name and
+        # iteration count at runtime — not from a pre-written script.
         # ─────────────────────────────────────────────────────────────────────
-        iteration       = 0
-        step_counter    = 4   # Tracks display step number (4, 5/6, 7, …)
-        final_answer    = ""
+        iteration    = 0
+        final_answer = ""
 
         while stop_reason == "tool_use" and iteration < MAX_ITERATIONS:
             iteration += 1
             self.memory.iteration_count = iteration
 
-            # Extract all tool calls from the last assistant message
             tool_use_blocks = [
                 block for block in assistant_msg["content"]
                 if "toolUse" in block
             ]
 
-            # ── Determine display step (4 or 6) ───────────────────────────────
-            is_secondary = iteration > 1
-            display_step = 6 if is_secondary else 4
-            tool_label   = "☁️  S3 Log Retrieval" if is_secondary else "🔌 MCP Postgres"
-            _step(display_step, f"Iteration {iteration} — {tool_label} — {len(tool_use_blocks)} tool call(s)")
+            # ── Dynamic step banner ───────────────────────────────────────────
+            # Label is built from what is ACTUALLY happening this iteration,
+            # not from a hardcoded position in a numbered list.
+            tool_names_called = [b["toolUse"]["name"] for b in tool_use_blocks]
+            banner_label = (
+                f"Tool Call (iter {iteration}) · {' + '.join(tool_names_called)}"
+            )
+            banner_icon = "🔌" if iteration == 1 else "🔄"
+            _step_banner(
+                number=3 + iteration,   # Steps 4, 5, 6, … as iterations grow
+                icon=banner_icon,
+                label=banner_label,
+                detail=f"{len(tool_use_blocks)} tool call(s) requested by executor",
+            )
 
-            # ── Execute all tool calls ─────────────────────────────────────────
+            # ── Execute each tool call ────────────────────────────────────────
             tool_result_blocks = []
             for block in tool_use_blocks:
                 tool_use    = block["toolUse"]
@@ -245,25 +328,18 @@ class AgentLoop:
                 tool_input  = tool_use["input"]
                 tool_use_id = tool_use["toolUseId"]
 
-                print(f"\n  Tool requested  : {tool_name}")
-                print(f"  Input arguments : {json.dumps(tool_input, indent=4)}")
+                print(f"\n  Tool            : {tool_name}")
+                print(f"  Arguments       : {json.dumps(tool_input, indent=4)}")
 
-                # Dispatch to the tool implementation
+                # Mark the associated planned task as in-progress
+                if tid := tool_task_map.get(tool_name):
+                    self.memory.start_task(tid)
+
                 tool_result = execute_tool(tool_name, tool_input)
                 self.memory.record_tool_call(tool_name, tool_input, tool_result)
 
-                # Mark relevant task as in-progress
-                task_map = {
-                    "query_deployment_ledger": "T1",
-                    "read_s3_log_file":        "T2",
-                    "send_notification":       "T4",
-                }
-                if tid := task_map.get(tool_name):
-                    self.memory.start_task(tid)
-
-                print(f"\n  Tool response   :")
-                result_str = json.dumps(tool_result, indent=4)
-                for line in result_str.splitlines()[:20]:
+                print(f"\n  Result          :")
+                for line in json.dumps(tool_result, indent=4).splitlines()[:20]:
                     print(f"    {line}")
 
                 tool_result_blocks.append({
@@ -273,122 +349,146 @@ class AgentLoop:
                     }
                 })
 
-            # ── STEP 5 (first iteration) or STEP 6+ · Observation & Reflection ─
-            obs_step = 5 if not is_secondary else 6
-            _step(obs_step, "Model loops results back into reasoning engine — evaluates progress")
-
-            # Append tool results and re-invoke the model
-            messages.append({"role": "user", "content": tool_result_blocks})
-
-            # Update system prompt with latest memory state
-            system_prompt = _SYSTEM_PROMPT.format(
-                memory_context=self.memory.build_context_block()
+            # ── Observation & Re-Plan ────────────────────────────────────────
+            # The banner label dynamically reflects what the model observed
+            # (derived from the tool names just executed, not a fixed label).
+            obs_label = f"Observation — After {' + '.join(tool_names_called)}"
+            _step_banner(
+                number=3 + iteration + 1,
+                icon="🔍",
+                label=obs_label,
+                detail="Executor loops results back into reasoning engine",
             )
 
-            response        = self._call_model(messages, system_prompt)
-            stop_reason     = response["stopReason"]
-            assistant_msg   = response["output"]["message"]
+            # Update the system prompt so the executor sees the latest task state
+            system_prompt = _EXECUTOR_SYSTEM_PROMPT.format(
+                memory_context=self.memory.build_context_block(),
+            )
+            messages.append({"role": "user", "content": tool_result_blocks})
+            response      = self._call_executor(messages, system_prompt)
+            stop_reason   = response["stopReason"]
+            assistant_msg = response["output"]["message"]
             messages.append({"role": "assistant", "content": assistant_msg["content"]})
 
-            # Display the model's observation/reasoning text
             obs_text = self._extract_text(assistant_msg["content"])
             if obs_text:
-                print(f"\n  Model observation:")
+                print(f"\n  Model observation:\n")
                 for line in obs_text.strip().splitlines()[:15]:
                     print(f"    {line}")
 
-            # ── Mark completed tasks based on tool call ────────────────────────
-            for block in tool_use_blocks:
-                tname = block["toolUse"]["name"]
-                if tid := task_map.get(tname):
-                    self.memory.complete_task(tid, notes=f"Completed via {tname}")
+            # Mark associated planned tasks as complete
+            for tool_name in tool_names_called:
+                if tid := tool_task_map.get(tool_name):
+                    self.memory.complete_task(tid, notes=f"Evidence from {tool_name}")
 
-            # ── GENCOST: flush to long-term if buffer is large ────────────────
+            # GENCOST: flush intermediate traces if buffer exceeds budget
             if self.memory.should_flush(TOKEN_FLUSH_BUDGET):
-                logger.info("[LOOP] Token budget exceeded — flushing to long-term memory")
                 self.memory.flush_to_long_term(
-                    summary=f"Iteration {iteration}: executed {len(tool_use_blocks)} tool(s). "
-                            f"Tasks done: {[t.task_id for t in self.memory.task_tree if t.status == 'DONE']}"
+                    summary=(
+                        f"Iteration {iteration}: called {tool_names_called}. "
+                        f"Tasks done: {[t.task_id for t in self.memory.task_tree if t.status == 'DONE']}"
+                    )
                 )
 
         # ─────────────────────────────────────────────────────────────────────
-        # STEP 8 · Token Reduction & Final Summarization
-        # Model has stopped issuing tool calls → it has its answer.
-        # We do a final compression pass before returning.
+        # FINAL STEP · Token Reduction & Output
+        # Dynamic number: one beyond the last observation step
         # ─────────────────────────────────────────────────────────────────────
-        _step(8, "Compress intermediate traces → synthesize clean human-readable output")
+        final_step_n = 3 + (iteration * 2) + 1
+        _step_banner(
+            number=final_step_n,
+            icon="🗜️ ",
+            label="Token Reduction & Final Output (GENCOST)",
+            detail=f"Completed in {iteration} iteration(s) — flushing intermediate traces",
+        )
 
         final_answer = self._extract_text(assistant_msg["content"])
 
-        # Flush remaining tool history to long-term memory (GENCOST)
         if self.memory.tool_history:
             self.memory.flush_to_long_term(
-                summary=(
-                    f"Root cause diagnosed in {iteration} iterations. "
-                    f"All tasks: {[t.status for t in self.memory.task_tree]}. "
-                    f"Final answer delivered to client."
-                )
+                summary=f"Diagnosis complete after {iteration} loop iterations. "
+                        f"All tasks: {[f'{t.task_id}={t.status}' for t in self.memory.task_tree]}."
             )
 
-        # Mark T3 as done (diagnosis complete)
-        self.memory.complete_task("T3", notes="Root cause identified from S3 log analysis")
-
         elapsed = (time.time() - t_start) * 1000
-        print(f"\n  Iterations      : {iteration}")
+        print(f"\n  Loop iterations : {iteration}")
         print(f"  Total latency   : {elapsed:.0f}ms")
-        print(f"  Long-term arcs  : {len(self.memory.long_term)}")
+        print(f"  Active model    : {self._active_model}")
         print(f"\n  Final task tree:")
         print(self.memory.task_summary())
 
         return final_answer
 
-    # ── Private helpers ───────────────────────────────────────────────────────
+    # ── Planner (Step 3): LLM-generated task tree ─────────────────────────────
 
-    def _call_model(self, messages: list[dict], system_prompt: str) -> dict:
+    def _llm_plan(self, user_input: str) -> list[dict]:
         """
-        Invoke Bedrock converse API with exponential backoff retry and
-        automatic model fallback on quota exhaustion.
+        Call the lightweight Planner model to generate a structured task list.
 
-        Retry strategy:
-          • Retryable errors (ThrottlingException, ServiceUnavailable):
-            exponential backoff — base 2s, doubles each attempt.
-          • After MAX_RETRIES on primary model: switch to fallback model
-            (lighter quota pool) and retry once more.
-          • Non-retryable errors: raise immediately.
+        Uses Nova Lite (cheap, fast) — not the frontier executor model.
+        Returns a list of dicts: [{"id": "T1", "description": "...", "tool_hint": "..."}]
 
-        The converse API is stateless — we reconstruct the full conversation
-        each call. AgentCore manages the session state boundary in production.
+        Falls back to an empty list on any failure; the executor LLM will
+        self-direct via tool calls in that case.
         """
-        logger.debug("[LOOP] Calling Bedrock — model=%s msgs=%d", self._active_model, len(messages))
+        tool_names = "\n".join(
+            f"  - {t['toolSpec']['name']}: {t['toolSpec']['description'][:80]}"
+            for t in TOOL_CONFIG["tools"]
+        )
+        prompt = _PLANNER_PROMPT.format(
+            tool_names=tool_names,
+            user_input=user_input,
+            memory_context=self.memory.build_context_block(),
+        )
+        logger.info("[PLANNER] Generating task tree with %s …", self._planner_model)
+        try:
+            resp = self._bedrock.converse(
+                modelId=self._planner_model,
+                messages=[{"role": "user", "content": [{"text": prompt}]}],
+                inferenceConfig={"maxTokens": 512, "temperature": 0.0},
+            )
+            raw = resp["output"]["message"]["content"][0]["text"]
+            # Strip markdown fences if the model wraps the JSON
+            clean = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            tasks = json.loads(clean)
+            logger.info("[PLANNER] Generated %d task(s): %s", len(tasks), [t["id"] for t in tasks])
+            print(f"\n  Planner model   : {self._planner_model}")
+            print(f"  Tasks generated : {len(tasks)}")
+            return tasks
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[PLANNER] Task generation failed: %s", exc)
+            print(f"  ⚠️   Planner failed ({exc.__class__.__name__}) — executor will self-direct")
+            return []
 
+    # ── Executor: Bedrock converse with retry + model fallback ────────────────
+
+    def _call_executor(self, messages: list[dict], system_prompt: str) -> dict:
+        """
+        Invoke the executor model (Bedrock converse) with exponential backoff
+        retry and automatic fallback to the lighter model on quota exhaustion.
+        """
+        logger.debug("[EXECUTOR] Calling %s — %d messages", self._active_model, len(messages))
         last_exc = None
-        for attempt in range(1, MAX_RETRIES + 2):   # +1 extra slot for fallback
+
+        for attempt in range(1, MAX_RETRIES + 2):
             try:
                 return self._bedrock.converse(
                     modelId=self._active_model,
                     messages=messages,
                     system=[{"text": system_prompt}],
                     toolConfig=TOOL_CONFIG,
-                    inferenceConfig={
-                        "maxTokens":   1_024,
-                        "temperature": 0.1,   # Low temp → deterministic tool selection
-                    },
+                    inferenceConfig={"maxTokens": 1_024, "temperature": 0.1},
                 )
             except ClientError as exc:
                 code = exc.response["Error"]["Code"]
-                msg  = exc.response["Error"]["Message"]
-
                 if code not in _RETRYABLE:
-                    logger.error("[LOOP] Non-retryable error (%s): %s", code, msg)
                     raise
-
                 last_exc = exc
 
-                # After exhausting retries on primary → try fallback model once
                 if attempt > MAX_RETRIES:
                     if self._active_model != self._fallback_model:
                         logger.warning(
-                            "[LOOP] 🚨 Quota exhausted on %s — switching to fallback model %s",
+                            "[EXECUTOR] 🚨 Quota exhausted on %s — switching to %s",
                             self._active_model, self._fallback_model,
                         )
                         print(
@@ -396,7 +496,6 @@ class AgentLoop:
                             f"\n  🔄  Switching to fallback: {self._fallback_model}\n"
                         )
                         self._active_model = self._fallback_model
-                        # One more attempt with fallback
                         try:
                             return self._bedrock.converse(
                                 modelId=self._active_model,
@@ -406,26 +505,16 @@ class AgentLoop:
                                 inferenceConfig={"maxTokens": 1_024, "temperature": 0.1},
                             )
                         except ClientError as fb_exc:
-                            logger.error("[LOOP] Fallback model also failed: %s", fb_exc)
                             raise fb_exc
-                    else:
-                        raise last_exc
+                    raise last_exc
 
                 wait = RETRY_BASE_DELAY_S * (2 ** (attempt - 1))
-                logger.warning(
-                    "[LOOP] %s (attempt %d/%d) — retrying in %ds …",
-                    code, attempt, MAX_RETRIES, wait,
-                )
+                logger.warning("[EXECUTOR] %s (attempt %d/%d) — retrying in %ds", code, attempt, MAX_RETRIES, wait)
                 print(f"  ⏳  {code} (attempt {attempt}/{MAX_RETRIES}) — retrying in {wait}s …")
                 time.sleep(wait)
 
-        raise last_exc  # should not reach here
+        raise last_exc
 
     @staticmethod
     def _extract_text(content_blocks: list[dict]) -> str:
-        """Concatenate all text blocks from a message content list."""
-        return "".join(
-            block["text"]
-            for block in content_blocks
-            if "text" in block
-        )
+        return "".join(b["text"] for b in content_blocks if "text" in b)
