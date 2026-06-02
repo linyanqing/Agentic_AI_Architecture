@@ -1,4 +1,4 @@
-# AWS AI — CORPSEE GenAI Framework
+# Agentic AI Architecture — CORPSEE GenAI Framework
 
 > **Enterprise GenAI on AWS**, architected across 7 well-designed pillars for the Sydney (`ap-southeast-2`) region.
 
@@ -36,7 +36,7 @@
 ## Repository Structure
 
 ```
-AWS_AI/
+Agentic_AI_Architecture/
 ├── architecture/
 │   ├── Bedrock_AgentCore_ReferenceArchitecture.md          ← Full reference architecture + component guide
 │   ├── AI_Architecture_Lens.txt                            ← Master CORPSEE 7-pillar framework blueprint
@@ -117,8 +117,8 @@ Background / evaluation paths:
 - Bedrock model access: `amazon.nova-micro-v1:0` + `anthropic.claude-3-5-sonnet-20241022-v2:0`
 
 ```bash
-git clone https://github.com/linyanqing/AWS_AI.git
-cd AWS_AI/corpss_app
+git clone https://github.com/linyanqing/Agentic_AI_Architecture.git
+cd Agentic_AI_Architecture/corpss_app
 pip install -r requirements.txt
 ```
 
