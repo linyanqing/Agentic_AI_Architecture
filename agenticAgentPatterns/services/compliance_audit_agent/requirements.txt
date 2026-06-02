@@ -1,0 +1,13 @@
+# Compliance Audit Agent — Python Dependencies
+# Install: pip install -r requirements.txt
+
+# ── LangGraph (state machine graph engine) ────────────────────────────────────
+langgraph>=0.2.0          # StateGraph, interrupt/resume, MemorySaver checkpointer
+langchain-core>=0.2.0     # BaseMessage types (transitive dep of langgraph)
+
+# ── AWS SDK ───────────────────────────────────────────────────────────────────
+boto3>=1.34.0             # Bedrock converse API, session management
+botocore>=1.34.0          # ClientError for throttle/auth exception handling
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0      # Optional: load .env for local development overrides
